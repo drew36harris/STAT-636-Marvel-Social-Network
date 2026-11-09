@@ -197,8 +197,7 @@ print(proj_summary)
 g_proj_unw <- proj_to_igraph(W, labels = char_labels)
 E(g_proj_unw)$weight <- 1  # drop shared-comic counts; keep topology only
 
-# Safe wrapper for centrality calls that may be slow or fail (e.g. eigen on
-# disconnected / singular graphs). Returns NA vector of the right length.
+# Safety for centrality calls that may be slow or fail. Returns NA vector of the right length.
 safely <- function(expr, n) {
   tryCatch({
     out <- expr
