@@ -5,9 +5,12 @@ library(dplyr)
 library(stringr)
 library(ggplot2)
 library(tibble)
+library(tidyr)
+
+# Added: Unweighted projections, Bipartite centralities, Projection centralities, and a quick comparison
 
 # Read and Parse
-path <-  "MarvelSocialNetwork.txt"
+path <-  "C:/Users/Mitchell/Downloads/MarvelSocialNetwork.txt"
 lines <- readLines(path, encoding="latin1") # File is Pajek-style. Vertices first, then Edges
 
 ### Get Counts
@@ -189,3 +192,100 @@ net_summary <- function(g, name, distances = TRUE) { # Summary function for one-
 }
 proj_summary <- net_summary(g_proj, "Character projection")
 print(proj_summary)
+
+# Unweighted projection (proposal: P_ik > 0)
+g_proj_unw <- proj_to_igraph(W, labels = char_labels)
+E(g_proj_unw)$weight <- 1  # drop shared-comic counts; keep topology only
+
+# Safe wrapper for centrality calls that may be slow or fail (e.g. eigen on
+# disconnected / singular graphs). Returns NA vector of the right length.
+safely <- function(expr, n) {
+  tryCatch({
+    out <- expr
+    out[!is.finite(out)] <- NA_real_
+    out
+  }, error = function(e) rep(NA_real_, n))
+}
+
+# Bipartite centralities
+# Exact degree on the full bipartite graph, but restrict to CHARACTER nodes
+# (we only rank characters; comics are the affiliation side).
+n_bip <- vcount(g_bip)
+char_vids_bip <- seq_len(n_char)  # vertices 1..n_char are characters (by construction)
+
+bip_deg   <- degree(g_bip)
+
+# Closeness/betweenness/eigenvector: estimate, using only character nodes as
+# sources so the result is comparable to the projection-side measures.
+# estimate* returns a vector for the *sources* only.
+bip_close <- safely(estimate_closeness(g_bip, vids = char_vids_bip,
+                                       cutoff = 4), n_char)
+bip_betw  <- safely(estimate_betweenness(g_bip, vids = char_vids_bip,
+                                         cutoff = 4), n_char)
+bip_eig   <- safely({
+  ev <- eigen_centrality(g_bip, directed = FALSE, scale = TRUE)
+  ev$vector[char_vids_bip]
+}, n_char)
+
+# Projection centralities
+# Given a projected graph g (n = n_char nodes, same order as char_labels),
+# return a tibble of the four centralities plus weighted strength.
+proj_centralities <- function(g, tag, weighted = TRUE) {
+  n <- vcount(g)
+  w_raw <- if (weighted) E(g)$weight else NULL
+  # distance-based measures need inverse weights (strong tie = short path)
+  w_dist <- if (weighted) {
+    w <- E(g)$weight
+    # zero-weight edges (cast-size-1 comics) become a large finite distance
+    ifelse(w > 0, 1 / w, 1e6)
+  } else NULL
+  
+  tibble(
+    id        = seq_len(n),
+    !!paste0(tag, "_degree")      := degree(g),
+    !!paste0(tag, "_strength")    := strength(g, weights = E(g)$weight),
+    !!paste0(tag, "_closeness")   := safely(
+      estimate_closeness(g, weights = w_dist, cutoff = 4), n),
+    !!paste0(tag, "_betweenness") := safely(
+      estimate_betweenness(g, weights = w_dist, cutoff = 4), n),
+    !!paste0(tag, "_eigen")       := safely(
+      eigen_centrality(g, directed = FALSE, weights = w_raw, scale = TRUE)$vector, n)
+  )
+}
+
+cent_unw <- proj_centralities(g_proj_unw, "unw")
+cent_w   <- proj_centralities(g_proj,     "w")
+cent_nw  <- proj_centralities(g_proj_nw,  "nw")
+
+# Assemble one character-level table
+char_cent <- tibble(
+  id     = seq_len(n_char),
+  label  = char_labels,
+  appearances = as.numeric(app_count),
+  # bipartite-side
+  bip_degree    = bip_deg[char_vids_bip],
+  bip_closeness = bip_close,
+  bip_betweenness = bip_betw,
+  bip_eigen     = bip_eig
+) %>%
+  left_join(cent_unw, by = "id") %>%
+  left_join(cent_w,   by = "id") %>%
+  left_join(cent_nw,  by = "id")
+
+# Sanity checks
+stopifnot(nrow(char_cent) == n_char)
+cat("NAs per centrality column:\n")
+print(colSums(is.na(char_cent[, -c(1, 2)])))
+
+# Top 10 by each centrality on the unweighted projection 
+top_by <- function(df, col, k = 10) {
+  df %>% arrange(desc(.data[[col]])) %>%
+    slice_head(n = k) %>%
+    transmute(label, value = .data[[col]], measure = col)
+}
+bind_rows(
+  top_by(char_cent, "bip_betweenness"),
+  top_by(char_cent, "unw_betweenness"),
+  top_by(char_cent, "w_betweenness"),
+  top_by(char_cent, "nw_betweenness")
+) %>% print(n = 40)
