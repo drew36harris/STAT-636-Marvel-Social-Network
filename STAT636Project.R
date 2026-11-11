@@ -10,7 +10,7 @@ library(tidyr)
 # Added: Unweighted projections, Bipartite centralities, Projection centralities, and a quick comparison
 
 # Read and Parse
-path <-  "C:/Users/Mitchell/Downloads/MarvelSocialNetwork.txt"
+path <-  "MarvelSocialNetwork.txt"
 lines <- readLines(path, encoding="latin1") # File is Pajek-style. Vertices first, then Edges
 
 ### Get Counts
@@ -288,3 +288,172 @@ bind_rows(
   top_by(char_cent, "w_betweenness"),
   top_by(char_cent, "nw_betweenness")
 ) %>% print(n = 40)
+
+# Strength
+### Raw -> sum over comics of cast-1 because each comic links every character cast-1 others
+str_raw <- as.numeric(strength(g_proj, weights=E(g_proj)$weight))
+
+### Newman -> number of appearances in comics with 2+ characters because (cast-1)* (1/(cast-1)) = 1
+str_nw <- as.numeric(strength(g_proj_nw, weights = E(g_proj_nw)$weight))
+
+# Distance -> Bipartite distances is double unweighted projection because bipartite routest character - comic - character for projection's character - character.
+## Character specific carries the same info, so differences for closeness would come from other choices rather than the structure
+samp <- sample(which(degree(g_proj_unw) > 0), 150)
+d_bip <- distances(g_bip, v=samp, to=samp)
+d_proj <- distances(g_proj_unw, v=samp, to=samp, weights=NA)
+fin <- is.finite(d_bip) & is.finite(d_proj)
+
+# Longer Centrality Comparisons
+RUN_THE_LONG_VERSION <- TRUE # Toggle on/off because this is gonna take a while
+char_vids <- seq_len(n_char)
+
+proj_cent <- function(g, tag, weighted) {
+  w_len <- if (weighted) 1 / E(g)$weight else NA # NA = ignore weights
+  w_str <- if (weighted) E(g)$weight else NA
+  out <- tibble(id = seq_len(vcount(g)))
+  if (!weighted) out[[paste0(tag, "_degree")]] <- as.numeric(degree(g)) # All three projections have the same edges, so their degrees are the same
+  if (weighted) out[[paste0(tag, "_strength")]] <- as.numeric(strength(g, weights = w_str))
+  out[[paste0(tag, "_harmonic")]] <- as.numeric(harmonic_centrality(g, weights = w_len, normalized = TRUE)) # Closeness only averages reachable nodes, harmonic includes unreachable nodes
+  out[[paste0(tag, "_betweenness")]] <- if (RUN_THE_LONG_VERSION) {
+    as.numeric(betweenness(g, directed = FALSE, weights = w_len))
+  } else NA_real_
+  out[[paste0(tag, "_eigen")]] <- as.numeric(eigen_centrality(g, directed = FALSE, weights = w_str, scale = TRUE)$vector)
+  out
+}
+
+cent_unw2 <- proj_cent(g_proj_unw, "unw", weighted = FALSE)
+cent_w2 <- proj_cent(g_proj, "w", weighted = TRUE)
+cent_nw2 <- proj_cent(g_proj_nw, "nw", weighted = TRUE)
+
+bip_degree_v <- as.numeric(degree(g_bip)[char_vids])
+bip_harm <- as.numeric(harmonic_centrality(g_bip, vids = char_vids, normalized = TRUE))
+bip_betw2 <- if (RUN_THE_LONG_VERSION) { # Bipartite betweenness counts parallel routes so there could be multiple shortest paths
+  as.numeric(betweenness(g_bip, v = char_vids, directed = FALSE))
+} else rep(NA_real_, n_char)
+bip_eig2     <- as.numeric(eigen_centrality(g_bip, directed = FALSE, scale = TRUE)$vector[char_vids])
+
+### Bringing it all together
+cent_all <- tibble(
+  id = char_vids,
+  label = char_labels,
+  bip_degree = bip_degree_v, # = appearances
+  bip_harmonic = bip_harm,
+  bip_betweenness = bip_betw2,
+  bip_eigen = bip_eig2
+) %>%
+  left_join(cent_unw2, by = "id") %>%
+  left_join(cent_w2,   by = "id") %>%
+  left_join(cent_nw2,  by = "id")
+
+measures <- setdiff(names(cent_all), c("id", "label"))
+cat("Measures:", paste(measures, collapse = ", "), "\n")
+
+if (exists("char_cent") && RUN_THE_LONG_VERSION) {
+  cutoff_check <- tibble(
+    measure = c("bip_betweenness", "unw_betweenness", "w_betweenness", "nw_betweenness"),
+    spearman_cutoff_vs_exact = sapply(measure, function(ms)
+      cor(char_cent[[ms]], cent_all[[ms]], method = "spearman", use = "complete.obs"))
+  )
+  print(cutoff_check)
+}
+
+# Comparisons
+### Rank Correlation
+rho <- cor(cent_all[, measures], method = "spearman", use = "pairwise.complete.obs")
+print(round(rho, 2))
+
+rho_long <- as.data.frame(as.table(rho)) %>%
+  rename(m1 = Var1, m2 = Var2, rho = Freq) %>%
+  mutate(m1 = factor(m1, levels = measures), m2 = factor(m2, levels = rev(measures)))
+
+p_rho <- ggplot(rho_long, aes(m1, m2, fill = rho)) +
+  geom_tile() +
+  geom_text(aes(label = sprintf("%.2f", rho)), size = 2.3) +
+  scale_fill_gradient2(low = "darkblue", mid = "white", high = "darkred", midpoint = 0.5, limits = c(0, 1), name = "Spearman") +
+  labs(title = "Do the measures rank characters the same way?", x = NULL, y = NULL) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+print(p_rho)
+
+### Top overlap
+TOP_K <- 20 # How many to check for overlap
+
+topk <- function(x, k) head(order(x, decreasing = TRUE), k)
+
+overlap <- outer(measures, measures, Vectorize(function(a, b)
+  length(intersect(topk(cent_all[[a]], TOP_K), topk(cent_all[[b]], TOP_K))) / TOP_K))
+
+dimnames(overlap) <- list(measures, measures)
+print(round(overlap, 2))
+
+top_lists <- sapply(measures, function(ms) cent_all$label[topk(cent_all[[ms]], 10)])
+print(as_tibble(top_lists), width = Inf)
+
+### Movement in the top
+rank_change <- function(df, a, b, min_app = 20, k = 10) {
+  d <- df %>%
+    mutate(rank_a = rank(-.data[[a]], ties.method = "average"),
+           rank_b = rank(-.data[[b]], ties.method = "average"),
+           shift = rank_a - rank_b) %>% # > 0 -> ranked higher
+    filter(bip_degree >= min_app)
+  list(better_under_b = d %>% slice_max(shift, n = k, with_ties = FALSE) %>%
+         select(label, bip_degree, rank_a, rank_b, shift),
+       worse_under_b = d %>% slice_min(shift, n = k, with_ties = FALSE) %>%
+         select(label, bip_degree, rank_a, rank_b, shift))
+}
+change_degree <- rank_change(cent_all, "bip_degree", "unw_degree")
+change_betw <- rank_change(cent_all, "bip_degree", "unw_betweenness")
+print(change_degree)
+print(change_betw)
+
+p_scatter <- ggplot(filter(cent_all, unw_degree > 0), aes(bip_degree, unw_degree)) +
+  geom_point(alpha = 0.3) + scale_x_log10() + scale_y_log10() +
+  labs(title = "Appearances vs. distinct co-stars", x = "Comics per character (bipartite degree)", y = "Distinct co-stars (unweighted projected degree)")
+print(p_scatter)
+
+### Clustering
+w_up <- as(triu(W, k = 1), "TsparseMatrix")@x # number of shared comics
+C4   <- sum(choose(w_up, 2)) # 4-cycles
+L3   <- sum((app_count[edges$character] - 1) * (cast_size[edges$comic - n_char] - 1)) # 3-edge paths
+RA   <- 4 * C4 / L3 # Robins-Alexander
+
+proj_sum <- net_summary(g_proj_unw, "Unweighted projection")
+bip_comp <- components(g_bip)
+struct <- tibble(
+  quantity = c("Nodes", 
+                 "Edges", 
+                 "Mean degree of characters", 
+                 "Median degree of characters",
+                 "Max degree of characters", 
+                 "Share of nodes in largest component",
+                 "Clustering", 
+                 "Mean character-character distance (hops of the projection)"),
+  bipartite = c(vcount(g_bip), # Nodes
+                 ecount(g_bip), # Edges
+                 mean(app_count), # Mean
+                 median(app_count), # Median
+                 max(app_count), # Max
+                 max(bip_comp$csize) / vcount(g_bip), # Share
+                 RA, # Clustering
+                 NA), # This is just 2x the projection
+  projection = c(vcount(g_proj_unw), # Nodes
+                 ecount(g_proj_unw), # Edges
+                 mean(cent_all$unw_degree), # Mean
+                 median(cent_all$unw_degree), # Median
+                 max(cent_all$unw_degree), # Max
+                 proj_sum$giant_share, # Share
+                 proj_sum$transitivity, # Clustering
+                 proj_sum$mean_distance) # Mean distance
+)
+print(struct, n = Inf, width = Inf)
+
+distort <- bind_rows(
+  ccdf(cent_all$bip_degree) %>% mutate(dist = "Comics per character (bipartite)"),
+  ccdf(as.numeric(cast_size)) %>% mutate(dist = "Characters per comic (bipartite)"),
+  ccdf(cent_all$unw_degree[cent_all$unw_degree > 0]) %>% mutate(dist = "Distinct co-stars (projection)")
+)
+p_ccdf_distort <- ggplot(distort, aes(x, p, colour = dist)) +
+  geom_point(alpha = 0.7) + scale_x_log10() + scale_y_log10() +
+  labs(title = "Degree distributions: bipartite vs. projected",
+       x = "Degree k", y = "P(degree >= k)", colour = NULL)
+print(p_ccdf_distort)
